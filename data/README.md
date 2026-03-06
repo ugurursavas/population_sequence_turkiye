@@ -1,7 +1,10 @@
-## c03-data-analysis
+## data
 
-This component contains the core analyses and modeling work built on top of the prepared data.
+This folder holds project datasets and intermediate artifacts used throughout the workflow.
 
-- **Typical contents**: statistical models, hypothesis tests, predictive models, and other analysis scripts or notebooks.
-- **Inputs**: curated datasets from `c01-data-transformation` and insights from `c02-data-exploration`.
-- **Outputs**: final tables, figures, model artifacts, and other deliverables, usually written to the `results` folder.
+- **Suggested structure**:
+  - `raw/`: original, immutable data as received.
+  - `interim/`: partially processed data and checkpoints.
+  - `processed/`: cleaned, analysis-ready datasets produced by `c01-data-transformation`.
+- **Good practices**: avoid committing large, proprietary, or sensitive data to version control; document data sources and access instructions here if data must be obtained separately.
+
