@@ -1,0 +1,642 @@
+---
+title: "Population Decline Trajectories in Türkiye: District-Level Sequence Analysis (2008–2025)"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    theme: cosmo
+editor: visual
+---
+
+## 1. Setup
+
+The following packages are required. TraMineR is the core package for sequence analysis. WeightedCluster provides cluster quality statistics. cluster performs hierarchical clustering. sf handles spatial data for mapping.
+
+```{r}
+install.packages(c("tidyverse", "TraMineR", "WeightedCluster", "cluster", "factoextra", "viridis", "sf"), dependencies = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(TraMineR)
+library(WeightedCluster)
+library(cluster)
+library(factoextra)
+library(viridis)
+library(sf)
+
+# Veri yükleme
+df <- read.csv("/Volumes/F/projects/2026/pop_districts/long_panel_pop_revised_2.csv", 
+               fileEncoding = "UTF-8-BOM")
+
+geo <- st_read("/Volumes/F/projects/2026/pop_districts/TUR_ADM2.geojson")
+```
+
+## 2. Net Population Change (2008–2025)
+
+### 2.1 Computing Net Change
+
+We compute the overall percentage change in population between 2008 and 2025 for each district. This identifies which districts experienced net population loss and forms the analytical sample for the sequence analysis.
+
+```{r}
+df_change <- df %>%
+  filter(year %in% c(2008, 2025)) %>%
+  group_by(asdf_id) %>%
+  summarise(
+    pop_2008 = population[year == 2008],
+    pop_2025 = population[year == 2025],
+    change   = (pop_2025 - pop_2008) / pop_2008 * 100,
+    .groups  = "drop"
+  )
+
+geo_change <- geo %>% left_join(df_change, by = "asdf_id")
+```
+
+```{r}
+
+
+# Önce dağılıma bak
+summary(df_change$change)
+quantile(df_change$change, c(0.02, 0.25, 0.5, 0.75, 0.95, 0.98, 0.99, 1), na.rm = TRUE)
+
+# Kaç ilçe 200'den büyük?
+df_change %>% filter(change > 200) %>% nrow()
+df_change %>% filter(change > 100) %>% nrow()
+```
+
+### 2.3 Map: Net Population Change
+
+The map uses a continuous colour gradient. Blue indicates growth, red indicates decline, white represents near-zero change. The scale is capped at −50% and +125%.
+
+```{r}
+ggplot(geo_change) +
+  geom_sf(aes(fill = change), color = "white", linewidth = 0.1) +
+  scale_fill_gradient2(
+    low      = "#08306b",
+    mid      = "#f7f7f7",
+    high     = "#67000d",
+    midpoint = 0,
+    limits   = c(-50, 125),
+    oob      = scales::squish,
+    breaks   = c(-50, -25, 0, 25, 50, 75, 100, 125),
+    labels   = c("≤−50%", "−25%", "0%", "+25%", "+50%", "+75%", "+100%", "≥+125%"),
+    name     = "Nüfus değişimi (%)"
+  ) +
+  theme_void() +
+  theme(
+    legend.position   = "right",
+    plot.title        = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.key.height = unit(1.5, "cm")
+  ) +
+  labs(title = "İlçe Bazında Nüfus Değişimi 2008-2025 (%)")
+```
+
+### 2.4 Identifying Declining Districts
+
+Districts with negative net change are identified. These 532 districts form the analytical sample for all subsequent steps.
+
+```{r}
+declining_ids <- df_change %>% 
+  filter(change < 0) %>% 
+  pull(asdf_id)
+
+cat("Toplam ilçe:", nrow(df_change), "\n")
+cat("Nüfus kaybeden ilçe:", length(declining_ids), "\n")
+```
+
+## 3. Annual Population Change Rates
+
+### 3.1 Computing Annual Rates
+
+For each declining district, the annual percentage rate of population change is computed for every year from 2009 to 2025. Temporary positive rates are retained as they are a genuine part of each district's trajectory.
+
+```{r}
+# Sadece düşen ilçelerin yıllık verisini al
+df_declining <- df %>%
+  filter(asdf_id %in% declining_ids) %>%
+  arrange(asdf_id, year) %>%
+  filter(year >= 2008, year <= 2025)
+
+# Yıllık değişim hızını hesapla
+df_declining <- df_declining %>%
+  group_by(asdf_id) %>%
+  mutate(rate = (population - lag(population)) / lag(population) * 100) %>%
+  ungroup() %>%
+  filter(!is.na(rate))
+
+# Kaç yıl var kontrol et
+cat("Yıllar:", unique(df_declining$year), "\n")
+cat("İlçe sayısı:", n_distinct(df_declining$asdf_id), "\n")
+cat("Satır sayısı:", nrow(df_declining), "\n")
+```
+
+### 3.2 Distributional Analysis
+
+The distribution is examined before defining states. Since the sample consists only of net-declining districts, it is naturally left-skewed. The median annual rate is around −1.43%; about 24% of observations are positive.
+
+```{r}
+#eşik değerleri belirlemek gerekiyor. sadece ilgili dönemde nüfusu düşen ilçeler. Ama bu ilçeler bazı yıllarda büyümüş olabilir 
+
+summary(df_declining$rate)
+quantile(df_declining$rate, 
+         c(0.05, 0.10, 0.20, 0.25, 0.33, 0.50, 0.67, 0.75, 0.80, 0.90, 0.95), 
+         na.rm = TRUE)
+
+# Pozitif ve negatif ayrı ayrı
+cat("\nNegatif oranların özeti:\n")
+summary(df_declining$rate[df_declining$rate < 0])
+
+cat("\nPozitif oranların özeti:\n")
+summary(df_declining$rate[df_declining$rate > 0])
+
+cat("\nPozitif oran yüzdesi:", 
+    round(sum(df_declining$rate > 0) / nrow(df_declining) * 100, 1), "%\n")
+```
+
+## 4. State Definition: Quantile-Based Thresholds
+
+### 4.1 Why Quantile-Based Thresholds?
+
+Since the distribution is strongly skewed, fixed thresholds would cause most observations to fall into just one or two states. Quantile-based thresholds adapt to the actual distribution and produce more balanced state frequencies, improving the stability and interpretability of the resulting trajectories.
+
+```{r}
+#Since we selected only the districts that experienced overall population decline during the period, the distribution of annual growth rates is naturally asymmetric. Even though these districts declined over the long run, they may still exhibit temporary positive growth in some years.
+#The empirical distribution of annual growth rates is as follows:
+#Min     -36
+#10%     -5.23
+#25%     -3.01
+#50%     -1.43
+#75%     -0.087
+#90%      2.21
+#Max     100
+#This distribution indicates several important features:
+#Most annual growth rates are negative, which is expected because the sample includes only declining districts.
+#The median annual change is −1.43%, suggesting that population decline is generally slow and gradual rather than abrupt.
+#The majority of observations lie between −3% and 0%, indicating moderate yearly population losses.
+#Positive annual growth rates still occur (about 24% of observations). These reflect temporary recoveries or fluctuations, even in districts that decline over the long term.
+#The maximum value (100%) is likely an outlier, possibly caused by small base populations or administrative changes.
+#For sequence analysis, all annual growth rates (negative and positive) are used when defining the states, because temporary recoveries are part of the population trajectory that the sequence method aims to capture.
+#This distribution shows that most observations are negative or close to zero, while positive values are relatively less frequent. Because of this asymmetry, using evenly spaced thresholds may not produce meaningful states.For this reason, thresholds can instead be determined based on the empirical distribution (quantiles). This approach allows the states to reflect the actual structure of the data.Another important decision is the number of states used in the sequence analysis. In the literature, it is common to use between five and seven states. Too few states may hide important differences between trajectories, while too many states can make interpretation difficult.Given the distribution above, a reasonable choice would be five or six states, which allows us to distinguish between different intensities of population decline while still capturing occasional growth periods.
+
+```
+
+### 4.2 Rationale
+
+```{r}
+# Why We Use Quantile-Based Thresholds
+#
+# In our analysis, we focus only on districts that experienced overall population
+# decline during the study period. Because of this sample selection, the distribution
+# of annual population growth rates is asymmetric. Most observations are negative
+# or close to zero, while positive growth rates appear less frequently. As a result,
+# the distribution is skewed toward negative values.
+#
+# If fixed thresholds (for example −3%, −1.5%, −0.5%, etc.) were used, many observations
+# would fall into the same category. This would create imbalanced state distributions,
+# where some states contain many observations while others contain very few. Such
+# imbalance can negatively affect sequence analysis because:
+#
+# - some states would have too few observations,
+# - trajectories would become less distinguishable,
+# - clustering results could become less stable.
+#
+# For this reason, thresholds are determined based on the empirical distribution
+# of the data.
+#
+# Using quantile-based thresholds provides several advantages:
+#
+# 1. It adapts to the actual data distribution.
+# 2. It produces more balanced numbers of observations across states.
+# 3. It improves the stability and interpretability of trajectory patterns
+#    in sequence analysis.
+# 4. It is particularly suitable for skewed distributions such as ours.
+#
+# Therefore, annual population growth rates are divided into six states using
+# quantile-based thresholds, allowing us to capture different intensities of
+# population decline as well as occasional growth episodes within declining districts.
+
+```
+
+### 4.3 Applying Thresholds
+
+Cut points are placed at the 10th, 25th, 50th, 75th, and 90th percentiles, producing six states with roughly balanced observation counts.
+
+```{r}
+# 6-state quantile thresholds
+breaks <- quantile(
+  df_declining$rate,
+  probs = c(0, 0.10, 0.25, 0.50, 0.75, 0.90, 1),
+  na.rm = TRUE
+)
+
+# create states
+df_declining$state <- cut(
+  df_declining$rate,
+  breaks = breaks,
+  include.lowest = TRUE
+)
+
+# check distribution
+table(df_declining$state)
+prop.table(table(df_declining$state))
+
+# The states are defined using quantile-based thresholds.
+# This approach divides the distribution of annual population growth rates
+# into six categories with relatively balanced numbers of observations.
+# As a result, no state is empty or overly dominant, which helps produce
+# more stable and interpretable trajectories in the sequence analysis.
+
+
+```
+
+## 5. Sequence Object
+
+### 5.1 Reshaping to Wide Format
+
+TraMineR requires data in wide format: one row per district, one column per year.
+
+```{r}
+library(tidyr)
+library(dplyr)
+#long to wide format
+seq_data <- df_declining %>%
+  select(asdf_id, year, state) %>%
+  pivot_wider(
+    names_from = year,
+    values_from = state
+  ) %>%
+  arrange(asdf_id)
+
+head(seq_data)
+
+```
+
+### 5.2 Sample Size Check
+
+```{r}
+nrow(seq_data)
+
+```
+
+### 5.3 Creating the Sequence Object
+
+The seqdef() function creates a TraMineR sequence object. Each row represents one district's 17-year trajectory through the six population change states (2009–2025).
+
+```{r}
+# Purpose: Create a sequence object for sequence analysis.
+# Each district's yearly state values (2009–2025) are combined into a sequence,
+# which allows us to analyse population change trajectories using the TraMineR package.
+
+library(TraMineR)
+
+# remove district id and keep only state columns
+seq_states <- seq_data[, -1]
+
+# create sequence object
+# alphabet parameter explicitly tells TraMineR the correct state order
+seq_obj <- seqdef(
+  seq_states,
+  alphabet = c("[-36.1,-5.23]", "(-5.23,-3.01]", "(-3.01,-1.43]",
+               "(-1.43,-0.0878]", "(-0.0878,2.22]", "(2.22,100]"),
+  labels = c("Strong decline", "Decline", "Moderate decline",
+             "Slight decline", "Stable / small growth", "Strong growth"),
+  cpal   = c("#b2182b", "#ef8a62", "#fddbc7", "#d1e5f0", "#67a9cf", "#2166ac")
+)
+
+# check the sequence object
+seq_obj
+
+
+```
+
+```{r}
+df_declining %>%
+  filter(year %in% c(2009, 2010), state == "[-36.1,-5.23]") %>%
+  count(year)
+```
+
+### 5.4 State Labels
+
+The six states correspond to the quantile-based breakpoints. State 1 is the strongest decline; State 6 is the strongest growth.
+
+```{r}
+# Interpretation of the state classification
+#
+# The state categories are derived from the quantile-based breakpoints of the
+# annual population growth rate distribution.
+#
+# Breakpoints (quantiles):
+# -36.1 → -5.23 → -3.01 → -1.43 → -0.0878 → 2.22 → 100
+#
+# Therefore, the logical ordering of the states is:
+#
+# State 1 : [-36.1 , -5.23]     → very strong decline
+# State 2 : (-5.23 , -3.01]     → strong decline
+# State 3 : (-3.01 , -1.43]     → moderate decline
+# State 4 : (-1.43 , -0.0878]   → slight decline
+# State 5 : (-0.0878 , 2.22]    → stable / small growth
+# State 6 : (2.22 , 100]        → strong growth
+#
+# Thus:
+# - State 1 represents the strongest population decline.
+# - State 6 represents the strongest population growth.
+#
+# Note: TraMineR may display states in a different order because the states are
+# stored as factor levels. However, the meaningful interpretation follows the
+# numerical order of the breakpoints.
+
+
+levels(df_declining$state)
+
+```
+
+### 5.5 State Distribution Plot
+
+The y-axis shows relative frequency (0 to 1) of districts in each state per year. Each bar sums to 1.0 covering 100% of the 532 declining districts.
+
+```{r}
+
+par(mar = c(10, 4, 2, 2))
+
+seqdplot(seq_obj, with.legend = FALSE, border = NA)
+
+usr <- par("usr")
+
+legend(
+  x = usr[1],
+  y = usr[3] - 0.35,
+  xpd = TRUE,
+  legend = c(
+    "Strong decline",
+    "Decline",
+    "Moderate decline",
+    "Slight decline",
+    "Stable / small growth",
+    "Strong growth"
+  ),
+  fill = c(
+    "#b2182b",
+    "#ef8a62",
+    "#fddbc7",
+    "#d1e5f0",
+    "#67a9cf",
+    "#2166ac"
+  ),
+  ncol = 3,
+  bty = "n",
+  cex = 0.85
+)
+# Interpretation of the state distribution plot
+#
+# The y-axis shows the relative frequency (proportion) of districts in each
+# population change state for a given year.
+#
+# For example, if the "Strong decline" category is approximately 0.12 in 2009,
+# this means that about 12% of the 532 declining districts experienced a strong
+# population decrease in that year.
+#
+# In absolute terms:
+# 0.12 * 532 ≈ 64 districts.
+#
+# Therefore, each stacked column represents the distribution of districts across
+# population change states in a given year, and the total always sums to 1
+# (i.e., 100% of the 532 districts).
+#
+# Importantly, although these districts are classified as declining over the
+# whole period (2008–2025), the figure shows that their yearly population
+# dynamics can fluctuate, with some districts experiencing temporary stabilization
+# or even population growth in certain years.
+
+
+```
+
+## 6. Sequence Distances
+
+### 6.1 Optimal Matching
+
+Pairwise distances between sequences are computed using Optimal Matching. The substitution cost matrix is derived from empirical transition rates (TRATE). This chunk may take a few minutes.
+
+```{r}
+# 1️⃣ substitution matrix oluştur
+submat <- seqsubm(seq_obj, method = "TRATE")
+
+# 2️⃣ sequence distance hesapla
+seq_dist <- seqdist(seq_obj, method = "OM", sm = submat, indel = 1)
+
+# 3️⃣ kontrol
+dim(seq_dist)
+
+
+
+
+
+```
+
+## 7. Cluster Analysis
+
+### 7.1 Ward Hierarchical Clustering
+
+Ward's method minimises total within-cluster variance at each step. Three quality indicators (ASW, PBC, HG) are evaluated for k = 2 to 10. k = 3 is selected because PBC is maximised, ASW remains high, and the solution is interpretable.
+
+```{r}
+# Purpose: Perform hierarchical clustering on the sequence distance matrix
+# Perform Ward hierarchical clustering on the sequence distance matrix.
+# This procedure groups districts with similar population change trajectories
+# over time into clusters.
+
+
+# Purpose: Perform hierarchical clustering on the sequence distance matrix.
+# The Ward method groups districts with similar population change trajectories
+# over time into clusters.
+
+library(cluster)
+library(TraMineR)
+
+# Ward hierarchical clustering
+clusterward <- agnes(seq_dist, diss = TRUE, method = "ward")
+
+# Evaluate optimal number of clusters
+# The function automatically tests cluster solutions from 2 up to ncluster.
+clust_stats <- as.clustrange(clusterward, diss = seq_dist, ncluster = 10)
+
+# Plot cluster quality statistics
+# ASW (Average Silhouette Width), PBC (Point Biserial Correlation),
+# and HG (Hubert’s Gamma) help determine the optimal number of clusters.
+plot(clust_stats, stat = c("ASW", "PBC", "HG"), norm = "zscore")
+
+#results:
+
+# This plot helps determine the optimal number of clusters.
+# Three cluster quality indicators are used:
+# ASW (Average Silhouette Width) – higher values indicate better cluster separation.
+# PBC (Point Biserial Correlation) – higher values indicate stronger clustering structure.
+# HG (Hubert’s Gamma) – higher values indicate better agreement between distances and clustering.
+
+# Interpretation of the plot:
+# ASW reaches its maximum around 2 clusters and then declines.
+# PBC reaches its maximum around 3 clusters.
+# HG increases after 6 clusters but shows less stability.
+
+# In sequence analysis literature, ASW and PBC are typically considered together.
+# Very small cluster solutions (such as 2 clusters) are usually avoided because
+# they produce overly broad and less informative groupings.
+
+# Based on these indicators, the most reasonable candidate solutions are:
+# 3 clusters or 4 clusters.
+
+# We select 3 clusters because:
+# - PBC reaches its maximum at 3 clusters
+# - ASW still remains relatively high
+# - The solution is easier to interpret
+
+
+
+
+```
+
+### 7.2 Assigning Cluster Membership
+
+The cutree() function cuts the Ward dendrogram at k = 3 and assigns a cluster label to each district.
+
+```{r}
+# Purpose: Attach cluster membership to each district.
+# Each district is assigned to one of the trajectory clusters
+# identified by Ward hierarchical clustering.
+
+# convert clustering result to hclust and extract clusters
+clusters <- cutree(as.hclust(clusterward), k = 3)
+
+# add cluster membership to sequence data
+seq_data$cluster <- clusters
+
+# check distribution of districts across clusters
+table(seq_data$cluster)
+
+
+
+```
+
+## 8. Visualising Trajectory Types
+
+### 8.1 State Distribution by Cluster
+
+The plot shows the state distribution for each cluster separately. Inspect this plot to confirm cluster labels.
+
+```{r}
+# Purpose: Visualise trajectory patterns for each cluster.
+# This helps interpret the population change trajectories.
+
+seqdplot(seq_obj, group = seq_data$cluster, border = NA)
+
+# Three distinct population trajectories are identified.
+# Cluster 1 shows fluctuating trajectories with alternating periods
+# of decline and growth. Cluster 2 represents persistent decline,
+# where negative population change dominates across the period.
+# Cluster 3 exhibits recovery trajectories, with several years of
+# positive population growth despite being classified as declining districts.
+
+
+```
+
+## 9. Map: Trajectory Clusters
+
+### 9.1 Cluster Map (Declining Districts Only)
+
+The map shows the 532 declining districts coloured by trajectory cluster.
+
+```{r}
+# Purpose: Map population trajectory clusters across districts of Türkiye
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+
+# 1 add cluster membership to district ids
+cluster_df <- data.frame(
+  asdf_id = seq_data$asdf_id,
+  cluster = seq_data$cluster
+)
+
+# 2 merge cluster info with geographic data
+map_data <- geo %>%
+  left_join(cluster_df, by = "asdf_id")
+
+# 3 convert cluster to factor for plotting
+map_data$cluster <- factor(map_data$cluster)
+
+# 4 plot map
+ggplot(map_data) +
+  geom_sf(aes(fill = cluster), color = NA) +
+  scale_fill_brewer(palette = "Set2", name = "Trajectory cluster") +
+  theme_minimal() +
+  labs(
+    title = "Population Decline Trajectories in Türkiye (District Level)",
+    subtitle = "Sequence clustering results"
+  )
+
+```
+
+### 9.2 Full Map: Clusters + Growing Districts
+
+All 973 districts are shown. Declining districts are coloured by cluster; the 441 growing districts are shown in light grey.
+
+```{r}
+# Purpose: Map trajectory clusters and show growing districts separately
+
+
+# cluster membership dataframe
+cluster_df <- data.frame(
+  asdf_id = seq_data$asdf_id,
+  cluster = seq_data$cluster
+)
+
+# merge clusters with geographic data
+map_data <- geo %>%
+  left_join(cluster_df, by = "asdf_id")
+
+# convert cluster variable
+map_data$cluster <- as.character(map_data$cluster)
+
+# districts not included in decline analysis = growing districts
+map_data$cluster[is.na(map_data$cluster)] <- "Growing districts"
+
+# rename clusters for interpretation
+map_data$cluster <- factor(
+  map_data$cluster,
+  levels = c("1","2","3","Growing districts"),
+  labels = c(
+    "Fluctuating trajectory",
+    "Persistent decline",
+    "Recovery trajectory",
+    "Growing districts"
+  )
+)
+
+# plot map
+ggplot(map_data) +
+  geom_sf(aes(fill = cluster), color = NA) +
+  scale_fill_manual(
+    values = c(
+      "Fluctuating trajectory" = "#66c2a5",
+      "Persistent decline" = "#fc8d62",
+      "Recovery trajectory" = "#8da0cb",
+      "Growing districts" = "grey85"
+    ),
+    name = "Population trajectory"
+  ) +
+  theme_void() +
+  labs(
+    title = "Population Change Trajectories in Türkiye",
+    subtitle = "Sequence clustering results (2009–2025)"
+  )
+
+
+```
+
+## 10. References
+
+-   González-Leonardo, M., Newsham, N., & Rowe, F. (2023). Understanding Population Decline Trajectories in Spain using Sequence Analysis. *Geographical Analysis*, 55, 495--516.
+-   Studer, M. (2013). WeightedCluster Library Manual. *LIVES Working Paper*, 24.
+-   Gabadinho, A., Ritschard, G., Müller, N. S., & Studer, M. (2011). Analyzing and Visualizing State Sequences in R with TraMineR. *Journal of Statistical Software*, 40(4).
+-   Ward, J. R. (1963). Hierarchical Grouping to Optimize an Objective Function. *Journal of the American Statistical Association*, 58(301), 236--244.
